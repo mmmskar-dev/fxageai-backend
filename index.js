@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 function toKES(fiat, price) {
   if (!price) return null;
 
-  // KES direct
+  // Direct KES
   if (fiat === "KES") return price;
 
   // East African currencies
@@ -19,48 +19,57 @@ function toKES(fiat, price) {
   if (fiat === "TZS") return price * 0.056;
   if (fiat === "NGN") return price * 0.082;
 
-  // Strong currencies
-  if (fiat === "EUR") return price * 170; // approx 1 EUR = 170 KES
-  if (fiat === "GBP") return price * 198; // approx 1 GBP = 198 KES
+  // Strong currencies (EUR/GBP) — use approx, avoid multiplying raw API integer
+  if (fiat === "EUR") return price; // keep raw for now, PWA can normalize
+  if (fiat === "GBP") return price;
 
   return null;
 }
 
 /* --- BINANCE P2P --- */
 async function binanceP2P(fiat) {
-  const res = await fetch(
-    "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        asset: "USDT",
-        fiat,
-        tradeType: "BUY",
-        page: 1,
-        rows: 5
-      })
-    }
-  );
-  const json = await res.json();
-  return json.data.map(ad => ({
-    source: "Binance",
-    fiat,
-    price: Number(ad.adv.price)
-  }));
+  try {
+    const res = await fetch(
+      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          asset: "USDT",
+          fiat,
+          tradeType: "BUY",
+          page: 1,
+          rows: 5
+        })
+      }
+    );
+    const json = await res.json();
+    return json.data.map(ad => ({
+      source: "Binance",
+      fiat,
+      price: Number(ad.adv.price)
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /* --- OKX P2P --- */
 async function okxP2P(fiat) {
-  const res = await fetch(
-    `https://www.okx.com/v3/c2c/tradingOrders/books?t=BUY&currency=USDT&quoteCurrency=${fiat}`
-  );
-  const json = await res.json();
-  return json.data.buy.map(ad => ({
-    source: "OKX",
-    fiat,
-    price: Number(ad.price)
-  }));
+  try {
+    const res = await fetch(
+      `https://www.okx.com/v3/c2c/tradingOrders/books?t=BUY&currency=USDT&quoteCurrency=${fiat}`
+    );
+    const json = await res.json();
+    if (!json.data || !json.data.buy) return [];
+    return json.data.buy.map(ad => ({
+      source: "OKX",
+      fiat,
+      price: Number(ad.price)
+    }));
+  } catch {
+    return [];
+  }
 }
 
 /* --- ARBITRAGE ENDPOINT --- */
@@ -70,8 +79,8 @@ app.get("/opportunities", async (req, res) => {
     let rows = [];
 
     for (let fiat of fiats) {
-      rows.push(...(await binanceP2P(fiat).catch(() => [])));
-      rows.push(...(await okxP2P(fiat).catch(() => [])));
+      rows.push(...(await binanceP2P(fiat)));
+      rows.push(...(await okxP2P(fiat)));
     }
 
     const normalized = rows
@@ -79,13 +88,11 @@ app.get("/opportunities", async (req, res) => {
         const ksh = toKES(r.fiat, r.price);
         return { ...r, ksh: ksh ? Number(ksh.toFixed(2)) : null };
       })
-      // Remove nulls and absurd values
-      .filter(r => r.ksh && r.ksh > 0 && r.ksh < 500);
+      .filter(r => r.ksh && r.ksh > 0 && r.ksh < 500); // sanity cap
 
-    // Sort descending for highest KES first
+    // Sort descending by KES value
     normalized.sort((a, b) => b.ksh - a.ksh);
 
-    // Return top 10
     res.json(normalized.slice(0, 10));
   } catch (e) {
     console.error(e);
