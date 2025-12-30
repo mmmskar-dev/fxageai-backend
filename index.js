@@ -1,84 +1,3 @@
-import express from "express";
-import fetch from "node-fetch";
-import cors from "cors";
-
-const app = express();
-app.use(cors());
-
-const PORT = process.env.PORT || 3000;
-
-/* --- FX NORMALIZATION TO KES --- */
-function toKES(fiat, price) {
-  if (!price || price <= 0) return null;
-
-  if (fiat === "KES") return price;
-  if (fiat === "UGX") return price * 0.036;
-  if (fiat === "TZS") return price * 0.056;
-  if (fiat === "NGN") return price * 0.082;
-
-  // EUR / GBP intentionally ignored for now (unstable OKX scaling)
-  return null;
-}
-
-/* --- BINANCE P2P --- */
-async function binanceP2P(fiat) {
-  try {
-    const res = await fetch(
-      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          asset: "USDT",
-          fiat,
-          tradeType: "BUY",
-          page: 1,
-          rows: 5
-        })
-      }
-    );
-    const json = await res.json();
-    return json.data.map(ad => ({
-      exchange: "Binance",
-      fiat,
-      price: Number(ad.adv.price)
-    }));
-  } catch {
-    return [];
-  }
-}
-
-/* --- OKX P2P (WORKING ENDPOINT) --- */
-async function okxP2P(fiat) {
-  try {
-    const res = await fetch(
-      "https://www.okx.com/priapi/v1/c2c/marketAds/list",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          side: "buy",
-          quoteCurrency: fiat,
-          baseCurrency: "USDT",
-          sortType: "price_asc",
-          page: 1,
-          rows: 5
-        })
-      }
-    );
-    const json = await res.json();
-    if (!json.data || !json.data.sell) return [];
-    return json.data.sell.map(ad => ({
-      exchange: "OKX",
-      fiat,
-      price: Number(ad.price)
-    }));
-  } catch {
-    return [];
-  }
-}
-
-/* --- ARBITRAGE ENGINE --- */
 app.get("/opportunities", async (req, res) => {
   const fiats = ["KES", "UGX", "TZS", "NGN"];
   let rows = [];
@@ -97,27 +16,32 @@ app.get("/opportunities", async (req, res) => {
     })
     .filter(r => r && r.ksh > 50 && r.ksh < 300);
 
-  if (normalized.length < 2) {
-    return res.json({ error: "Not enough data" });
+  // SORT ASCENDING BY BUY PRICE
+  normalized.sort((a, b) => a.ksh - b.ksh);
+
+  const capital = 10000;
+  const routes = [];
+
+  for (let i = 0; i < normalized.length - 1; i++) {
+    for (let j = normalized.length - 1; j > i; j--) {
+      const buy = normalized[i];
+      const sell = normalized[j];
+      const spread = sell.ksh - buy.ksh;
+      if (spread <= 0) continue;
+
+      const usdt = capital / buy.ksh;
+      const profit = usdt * spread;
+
+      routes.push({
+        buy,
+        sell,
+        spreadKES: Number(spread.toFixed(2)),
+        profitKES: Number(profit.toFixed(2))
+      });
+    }
   }
 
-  const buy = normalized.reduce((a, b) => a.ksh < b.ksh ? a : b);
-  const sell = normalized.reduce((a, b) => a.ksh > b.ksh ? a : b);
+  routes.sort((a, b) => b.profitKES - a.profitKES);
 
-  const spread = sell.ksh - buy.ksh;
-  const capitalKES = 10000;
-  const usdtBought = capitalKES / buy.ksh;
-  const profitKES = usdtBought * spread;
-
-  res.json({
-    buy,
-    sell,
-    spreadKES: Number(spread.toFixed(2)),
-    capitalKES,
-    profitKES: Number(profitKES.toFixed(2))
-  });
+  res.json(routes.slice(0, 2)); // TOP 2 ROUTES
 });
-
-app.listen(PORT, () =>
-  console.log("FXageAI arbitrage engine running on", PORT)
-);
