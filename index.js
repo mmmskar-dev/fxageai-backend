@@ -5,148 +5,178 @@ const cors = require("cors");
 const app = express();
 app.use(cors());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 /* =========================
-   FX RATE CACHE (KES BASE)
+   FX CACHE (MID-MARKET)
 ========================= */
+
 let fxRates = {
   UGX: null,
   TZS: null,
-  NGN: null,
-  updatedAt: null
+  updated: null,
 };
 
-async function fetchFX(from) {
+async function updateFXRates() {
   try {
     const res = await fetch(
-      `https://api.exchangerate.host/convert?from=${from}&to=KES`
+      "https://api.exchangerate.host/latest?base=KES&symbols=UGX,TZS"
     );
     const data = await res.json();
-    if (data && data.result) return data.result;
+
+    fxRates.UGX = data.rates.UGX;
+    fxRates.TZS = data.rates.TZS;
+    fxRates.updated = new Date().toISOString();
+
+    console.log("FX updated:", fxRates);
   } catch (err) {
-    console.error(`FX error ${from}:`, err.message);
+    console.error("FX update failed:", err.message);
   }
-  return null;
 }
 
-async function updateFXRates() {
-  console.log("🔄 Updating FX rates...");
-  const [ugx, tzs, ngn] = await Promise.all([
-    fetchFX("UGX"),
-    fetchFX("TZS"),
-    fetchFX("NGN")
-  ]);
-
-  if (ugx) fxRates.UGX = ugx;
-  if (tzs) fxRates.TZS = tzs;
-  if (ngn) fxRates.NGN = ngn;
-
-  fxRates.updatedAt = new Date().toISOString();
-  console.log("✅ FX Updated:", fxRates);
-}
-
-// Initial + hourly refresh
+// update FX on boot + every hour
 updateFXRates();
 setInterval(updateFXRates, 60 * 60 * 1000);
 
 /* =========================
-   HELPERS
+   HELPERS (A)
 ========================= */
-function toKES(fiat, price) {
-  if (!price || price <= 0) return null;
-  if (fiat === "KES") return price;
-  if (fxRates[fiat]) return price * fxRates[fiat];
-  return null;
+
+function impliedFX(sellFiatPrice, buyKES) {
+  if (!sellFiatPrice || !buyKES) return null;
+  return Number((sellFiatPrice / buyKES).toFixed(2));
 }
 
-function calcSpread(buyKES, sellKES) {
-  if (!buyKES || !sellKES) return null;
-  const spread = sellKES - buyKES;
-  return spread > 0 ? Number(spread.toFixed(2)) : null;
+function deviation(implied, market) {
+  if (!implied || !market) return null;
+  return Number((((implied - market) / market) * 100).toFixed(2));
 }
 
-function profitOnCapital(spread, capital = 10000, buyKES) {
-  if (!spread || !buyKES) return null;
-  const usdt = capital / buyKES;
-  return Number((usdt * spread).toFixed(2));
+function classify(dev) {
+  if (dev >= 2.5) return "EXECUTABLE";
+  if (dev >= 1.0) return "WATCH";
+  return "SKIP";
+}
+
+function profitKES(capital, dev) {
+  if (!dev) return 0;
+  return Math.round((capital * dev) / 100);
 }
 
 /* =========================
-   P2P FETCHERS
+   BINANCE P2P FETCH
 ========================= */
-async function fetchBinance(fiat, tradeType) {
-  const res = await fetch("https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      fiat,
-      tradeType,
-      asset: "USDT",
-      payTypes: [],
-      page: 1,
-      rows: 5
-    })
-  });
-  const json = await res.json();
-  return json?.data || [];
+
+async function fetchBinanceBest(asset, fiat, tradeType) {
+  try {
+    const res = await fetch(
+      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          asset,
+          fiat,
+          tradeType,
+          page: 1,
+          rows: 1,
+        }),
+      }
+    );
+
+    const data = await res.json();
+    return Number(data.data[0].adv.price);
+  } catch {
+    return null;
+  }
 }
 
 /* =========================
-   ARBITRAGE ENGINE
+   RETAIL CORRIDOR ENGINE (B)
 ========================= */
+
 app.get("/opportunities", async (req, res) => {
   try {
-    const fiats = ["KES", "UGX", "TZS", "NGN"];
-    let prices = [];
-
-    for (const fiat of fiats) {
-      const sells = await fetchBinance(fiat, "SELL"); // you BUY from sellers
-      const buys  = await fetchBinance(fiat, "BUY");  // you SELL to buyers
-
-      if (!sells.length || !buys.length) continue;
-
-      const lowestSell = Math.min(...sells.map(a => Number(a.adv.price)));
-      const highestBuy = Math.max(...buys.map(a => Number(a.adv.price)));
-
-      const buyKES  = toKES(fiat, lowestSell);
-      const sellKES = toKES(fiat, highestBuy);
-
-      const spread = calcSpread(buyKES, sellKES);
-      if (!spread) continue;
-
-      prices.push({
-        route: `Binance USDT/${fiat}`,
-        buyKES: Number(buyKES.toFixed(2)),
-        sellKES: Number(sellKES.toFixed(2)),
-        spreadKES: spread,
-        profitKES: profitOnCapital(spread, 10000, buyKES)
-      });
+    if (!fxRates.UGX || !fxRates.TZS) {
+      return res.json({ message: "FX not ready yet" });
     }
 
-    prices.sort((a, b) => b.spreadKES - a.spreadKES);
-    res.json({
-      fxUpdatedAt: fxRates.updatedAt,
-      capitalKES: 10000,
-      opportunities: prices.slice(0, 10)
+    // Binance P2P prices
+    const buyKES = await fetchBinanceBest("USDT", "KES", "BUY");
+    const sellUGX = await fetchBinanceBest("USDT", "UGX", "SELL");
+    const sellTZS = await fetchBinanceBest("USDT", "TZS", "SELL");
+
+    const opportunities = [];
+
+    /* ---- KES → UGX ---- */
+    const impliedUGX = impliedFX(sellUGX, buyKES);
+    const devUGX = deviation(impliedUGX, fxRates.UGX);
+
+    opportunities.push({
+      route: "KES → USDT → UGX",
+      buyKES,
+      sellFiat: sellUGX,
+      marketFX: fxRates.UGX,
+      impliedFX: impliedUGX,
+      deviation: devUGX,
+      profitKES: profitKES(10000, devUGX),
+      status: classify(devUGX),
     });
 
+    /* ---- KES → TZS ---- */
+    const impliedTZS = impliedFX(sellTZS, buyKES);
+    const devTZS = deviation(impliedTZS, fxRates.TZS);
+
+    opportunities.push({
+      route: "KES → USDT → TZS",
+      buyKES,
+      sellFiat: sellTZS,
+      marketFX: fxRates.TZS,
+      impliedFX: impliedTZS,
+      deviation: devTZS,
+      profitKES: profitKES(10000, devTZS),
+      status: classify(devTZS),
+    });
+
+    /* ---- UGX ↔ TZS corridor ---- */
+    const ugxToKes = 1 / fxRates.UGX;
+    const impliedUGX_TZS = sellTZS * ugxToKes;
+    const marketUGX_TZS = fxRates.TZS / fxRates.UGX;
+    const devUGX_TZS = deviation(impliedUGX_TZS, marketUGX_TZS);
+
+    opportunities.push({
+      route: "UGX ↔ TZS (corridor)",
+      impliedFX: impliedUGX_TZS.toFixed(2),
+      marketFX: marketUGX_TZS.toFixed(2),
+      deviation: devUGX_TZS,
+      profitKES: profitKES(10000, devUGX_TZS),
+      status: classify(devUGX_TZS),
+    });
+
+    res.json({
+      updated: fxRates.updated,
+      capitalKES: 10000,
+      opportunities: opportunities
+        .filter((o) => o.status !== "SKIP")
+        .sort((a, b) => b.deviation - a.deviation),
+    });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Arbitrage engine error" });
+    res.status(500).json({ error: err.message });
   }
 });
 
 /* =========================
    HEALTH CHECK
 ========================= */
+
 app.get("/", (req, res) => {
-  res.json({
-    status: "FXageAI backend running",
-    fxRates
-  });
+  res.send("FXageAI Retail Backend running");
 });
 
-app.listen(PORT, () =>
-  console.log(`🚀 FXageAI backend running on port ${PORT}`)
-);
+/* =========================
+   SERVER START
+========================= */
+
+app.listen(PORT, () => {
+  console.log(`FXageAI backend running on port ${PORT}`);
+});
