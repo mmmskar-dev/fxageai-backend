@@ -1,182 +1,206 @@
-const express = require("express");
-const fetch = require("node-fetch");
-const cors = require("cors");
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FXageAI – P2P Arbitrage Monitor</title>
 
-const app = express();
-app.use(cors());
-
-const PORT = process.env.PORT || 10000;
-
-/* =========================
-   FX CACHE (MID-MARKET)
-========================= */
-
-let fxRates = {
-  UGX: null,
-  TZS: null,
-  updated: null,
-};
-
-async function updateFXRates() {
-  try {
-    const res = await fetch(
-      "https://api.exchangerate.host/latest?base=KES&symbols=UGX,TZS"
-    );
-    const data = await res.json();
-
-    fxRates.UGX = data.rates.UGX;
-    fxRates.TZS = data.rates.TZS;
-    fxRates.updated = new Date().toISOString();
-
-    console.log("FX updated:", fxRates);
-  } catch (err) {
-    console.error("FX update failed:", err.message);
-  }
-}
-
-// update FX on boot + every hour
-updateFXRates();
-setInterval(updateFXRates, 60 * 60 * 1000);
-
-/* =========================
-   HELPERS (A)
-========================= */
-
-function impliedFX(sellFiatPrice, buyKES) {
-  if (!sellFiatPrice || !buyKES) return null;
-  return Number((sellFiatPrice / buyKES).toFixed(2));
-}
-
-function deviation(implied, market) {
-  if (!implied || !market) return null;
-  return Number((((implied - market) / market) * 100).toFixed(2));
-}
-
-function classify(dev) {
-  if (dev >= 2.5) return "EXECUTABLE";
-  if (dev >= 1.0) return "WATCH";
-  return "SKIP";
-}
-
-function profitKES(capital, dev) {
-  if (!dev) return 0;
-  return Math.round((capital * dev) / 100);
-}
-
-/* =========================
-   BINANCE P2P FETCH
-========================= */
-
-async function fetchBinanceBest(asset, fiat, tradeType) {
-  try {
-    const res = await fetch(
-      "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          asset,
-          fiat,
-          tradeType,
-          page: 1,
-          rows: 1,
-        }),
-      }
-    );
-
-    const data = await res.json();
-    return Number(data.data[0].adv.price);
-  } catch {
-    return null;
-  }
-}
-
-/* =========================
-   RETAIL CORRIDOR ENGINE (B)
-========================= */
-
-app.get("/opportunities", async (req, res) => {
-  try {
-    if (!fxRates.UGX || !fxRates.TZS) {
-      return res.json({ message: "FX not ready yet" });
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0b1320;
+      color: #eaf0ff;
     }
 
-    // Binance P2P prices
-    const buyKES = await fetchBinanceBest("USDT", "KES", "BUY");
-    const sellUGX = await fetchBinanceBest("USDT", "UGX", "SELL");
-    const sellTZS = await fetchBinanceBest("USDT", "TZS", "SELL");
+    header {
+      padding: 12px;
+      background: #020617;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
 
-    const opportunities = [];
+    h1 {
+      font-size: 18px;
+      color: #0fb9b1;
+    }
 
-    /* ---- KES → UGX ---- */
-    const impliedUGX = impliedFX(sellUGX, buyKES);
-    const devUGX = deviation(impliedUGX, fxRates.UGX);
+    .fx {
+      font-size: 13px;
+      background: #111827;
+      padding: 6px 10px;
+      border-radius: 8px;
+    }
 
-    opportunities.push({
-      route: "KES → USDT → UGX",
-      buyKES,
-      sellFiat: sellUGX,
-      marketFX: fxRates.UGX,
-      impliedFX: impliedUGX,
-      deviation: devUGX,
-      profitKES: profitKES(10000, devUGX),
-      status: classify(devUGX),
-    });
+    main {
+      padding: 12px;
+    }
 
-    /* ---- KES → TZS ---- */
-    const impliedTZS = impliedFX(sellTZS, buyKES);
-    const devTZS = deviation(impliedTZS, fxRates.TZS);
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
 
-    opportunities.push({
-      route: "KES → USDT → TZS",
-      buyKES,
-      sellFiat: sellTZS,
-      marketFX: fxRates.TZS,
-      impliedFX: impliedTZS,
-      deviation: devTZS,
-      profitKES: profitKES(10000, devTZS),
-      status: classify(devTZS),
-    });
+    .box {
+      background: #111a2b;
+      border-radius: 14px;
+      padding: 10px;
+    }
 
-    /* ---- UGX ↔ TZS corridor ---- */
-    const ugxToKes = 1 / fxRates.UGX;
-    const impliedUGX_TZS = sellTZS * ugxToKes;
-    const marketUGX_TZS = fxRates.TZS / fxRates.UGX;
-    const devUGX_TZS = deviation(impliedUGX_TZS, marketUGX_TZS);
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
 
-    opportunities.push({
-      route: "UGX ↔ TZS (corridor)",
-      impliedFX: impliedUGX_TZS.toFixed(2),
-      marketFX: marketUGX_TZS.toFixed(2),
-      deviation: devUGX_TZS,
-      profitKES: profitKES(10000, devUGX_TZS),
-      status: classify(devUGX_TZS),
-    });
+    th, td {
+      padding: 6px;
+      text-align: center;
+    }
 
-    res.json({
-      updated: fxRates.updated,
-      capitalKES: 10000,
-      opportunities: opportunities
-        .filter((o) => o.status !== "SKIP")
-        .sort((a, b) => b.deviation - a.deviation),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    /* Flag color headers */
+    .kes th { background: linear-gradient(90deg, black, red, green); }
+    .ugx th { background: linear-gradient(90deg, black, yellow, red); }
+    .tzs th { background: linear-gradient(90deg, green, yellow, blue); }
+
+    .advice {
+      background: #111a2b;
+      border-radius: 14px;
+      padding: 12px;
+      margin-top: 14px;
+    }
+
+    input, button {
+      padding: 8px;
+      border-radius: 8px;
+      border: none;
+      margin-top: 6px;
+    }
+
+    button {
+      background: #0fb9b1;
+      font-weight: bold;
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+  <h1>FXageAI – Live P2P Arbitrage</h1>
+  <div class="fx">Mid FX: 1 USD = 145.20 KES</div>
+</header>
+
+<main>
+
+  <div class="grid">
+
+    <!-- BINANCE -->
+    <div class="box">
+      <h3>Binance P2P</h3>
+
+      <table>
+        <thead class="kes">
+          <tr><th colspan="2">KES (KES)</th></tr>
+          <tr><th>Buy</th><th>Sell</th></tr>
+        </thead>
+        <tbody id="b-kes"></tbody>
+      </table>
+
+      <table>
+        <thead class="ugx">
+          <tr><th colspan="2">UGX → KES</th></tr>
+          <tr><th>Buy</th><th>Sell</th></tr>
+        </thead>
+        <tbody id="b-ugx"></tbody>
+      </table>
+
+      <table>
+        <thead class="tzs">
+          <tr><th colspan="2">TZS → KES</th></tr>
+          <tr><th>Buy</th><th>Sell</th></tr>
+        </thead>
+        <tbody id="b-tzs"></tbody>
+      </table>
+    </div>
+
+    <!-- OKX -->
+    <div class="box">
+      <h3>OKX P2P</h3>
+
+      <table>
+        <thead class="kes">
+          <tr><th colspan="2">KES (KES)</th></tr>
+          <tr><th>Buy</th><th>Sell</th></tr>
+        </thead>
+        <tbody id="o-kes"></tbody>
+      </table>
+
+      <table>
+        <thead class="ugx">
+          <tr><th colspan="2">UGX → KES</th></tr>
+          <tr><th>Buy</th><th>Sell</th></tr>
+        </thead>
+        <tbody id="o-ugx"></tbody>
+      </table>
+
+      <table>
+        <thead class="tzs">
+          <tr><th colspan="2">TZS → KES</th></tr>
+          <tr><th>Buy</th><th>Sell</th></tr>
+        </thead>
+        <tbody id="o-tzs"></tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <div class="advice">
+    <h3>Advisory & Profit (KES)</h3>
+    <label>Capital (KES)</label><br>
+    <input id="capital" value="100000"><br>
+    <button onclick="calc()">Compute Profit</button>
+    <p id="out"></p>
+  </div>
+
+</main>
+
+<script>
+  const FX = {
+    UGX: 0.038,
+    TZS: 0.058
+  };
+
+  function rows(buy, sell, rate = 1) {
+    let r = '';
+    for (let i = 0; i < 10; i++) {
+      r += `<tr>
+        <td>${((buy+i)*rate).toFixed(2)} KES</td>
+        <td>${((sell+i)*rate).toFixed(2)} KES</td>
+      </tr>`;
+    }
+    return r;
   }
-});
 
-/* =========================
-   HEALTH CHECK
-========================= */
+  document.getElementById('b-kes').innerHTML = rows(146,145);
+  document.getElementById('b-ugx').innerHTML = rows(3800,3750,FX.UGX);
+  document.getElementById('b-tzs').innerHTML = rows(2550,2500,FX.TZS);
 
-app.get("/", (req, res) => {
-  res.send("FXageAI Retail Backend running");
-});
+  document.getElementById('o-kes').innerHTML = rows(147,146);
+  document.getElementById('o-ugx').innerHTML = rows(3850,3780,FX.UGX);
+  document.getElementById('o-tzs').innerHTML = rows(2600,2520,FX.TZS);
 
-/* =========================
-   SERVER START
-========================= */
+  function calc(){
+    const cap = Number(document.getElementById('capital').value);
+    const usdt = cap / 146;
+    const back = usdt * 3850 * FX.UGX;
+    document.getElementById('out').innerText =
+      `Final: ${back.toFixed(0)} KES | Profit: ${(back-cap).toFixed(0)} KES`;
+  }
+</script>
 
-app.listen(PORT, () => {
-  console.log(`FXageAI backend running on port ${PORT}`);
-});
+</body>
+</html>
